@@ -17,7 +17,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import DPODataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, add_eval_generate_args, should_run_eval, run_eval_generate, unwrap_model
 
 warnings.filterwarnings('ignore')
 
@@ -105,20 +105,25 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             
             if wandb: wandb.log({"loss": current_loss, "dpo_loss": current_dpo_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        should_eval = should_run_eval(args, step, iters)
+        should_save = (step % args.save_interval == 0 or step == iters) and is_main_process()
+
+        del x_chosen, x_rejected, y_chosen, y_rejected, mask_chosen, mask_rejected, x, y, mask
+        del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, dpo_loss_val, loss
+
+        if should_eval:
+            run_eval_generate(model, tokenizer, args, autocast_ctx, step)
+
+        if should_save:
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            raw_model = unwrap_model(model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
             del state_dict
-
-        del x_chosen, x_rejected, y_chosen, y_rejected, mask_chosen, mask_rejected, x, y, mask
-        del ref_outputs, ref_logits, ref_log_probs, outputs, logits, policy_log_probs, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
@@ -142,6 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
+    add_eval_generate_args(parser, default_interval=1000, default_prompts=["你好，请介绍一下你自己。", "请给出一个学习机器学习的计划。"], use_chat_template=1)
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=1024, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")

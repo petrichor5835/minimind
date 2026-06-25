@@ -16,47 +16,9 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, add_eval_generate_args, should_run_eval, run_eval_generate, unwrap_model
 
 warnings.filterwarnings('ignore')
-
-
-def unwrap_model(model):
-    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-    return getattr(raw_model, '_orig_mod', raw_model)
-
-
-def run_eval_generate(model, tokenizer, step):
-    if not args.eval_prompts:
-        return
-
-    raw_model = unwrap_model(model)
-    was_training = raw_model.training
-    raw_model.eval()
-
-    Logger(f'\n========== Eval Generate @ step {step} ==========')
-    with torch.inference_mode():
-        for prompt in args.eval_prompts:
-            inputs = tokenizer(prompt, return_tensors="pt")
-            input_ids = inputs["input_ids"].to(args.device)
-            attention_mask = inputs.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(args.device)
-
-            with autocast_ctx:
-                output_ids = raw_model.generate(
-                    inputs=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=args.eval_max_new_tokens,
-                    temperature=args.eval_temperature,
-                    top_p=args.eval_top_p,
-                    do_sample=bool(args.eval_do_sample),
-                    eos_token_id=tokenizer.eos_token_id,
-                )
-            text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
-            Logger(f'[Prompt] {prompt}\n[Output] {text}\n')
-
-    raw_model.train(was_training)
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
@@ -96,13 +58,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        should_eval = args.eval_interval > 0 and is_main_process() and (step % args.eval_interval == 0 or step == iters)
+        should_eval = should_run_eval(args, step, iters)
         should_save = (step % args.save_interval == 0 or step == iters) and is_main_process()
 
         del input_ids, labels, res, loss
 
         if should_eval:
-            run_eval_generate(model, tokenizer, step)
+            run_eval_generate(model, tokenizer, args, autocast_ctx, step)
 
         if should_save:
             model.eval()
@@ -137,12 +99,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
-    parser.add_argument("--eval_interval", type=int, default=1000, help="生成评估间隔，<=0表示关闭")
-    parser.add_argument("--eval_max_new_tokens", type=int, default=80, help="每个评估prompt最多生成的token数")
-    parser.add_argument("--eval_temperature", type=float, default=0.8, help="生成评估temperature")
-    parser.add_argument("--eval_top_p", type=float, default=0.9, help="生成评估top_p")
-    parser.add_argument("--eval_do_sample", type=int, default=1, choices=[0, 1], help="生成评估是否采样（0=贪心，1=采样）")
-    parser.add_argument("--eval_prompts", nargs='*', default=["The capital of China is"], help="生成评估用的prompt列表")
+    add_eval_generate_args(parser, default_interval=1000, default_prompts=["The capital of China is"], use_chat_template=0, max_new_tokens=80)
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")

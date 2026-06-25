@@ -37,6 +37,69 @@ def Logger(content):
         print(content)
 
 
+def unwrap_model(model):
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    return getattr(raw_model, '_orig_mod', raw_model)
+
+
+def add_eval_generate_args(parser, default_interval=1000, default_prompts=None, use_chat_template=1, max_new_tokens=128):
+    default_prompts = default_prompts or ["你好，请介绍一下你自己。"]
+    parser.add_argument("--eval_interval", type=int, default=default_interval, help="生成评估间隔，<=0表示关闭")
+    parser.add_argument("--eval_max_new_tokens", type=int, default=max_new_tokens, help="每个评估prompt最多生成的token数")
+    parser.add_argument("--eval_temperature", type=float, default=0.8, help="生成评估temperature")
+    parser.add_argument("--eval_top_p", type=float, default=0.9, help="生成评估top_p")
+    parser.add_argument("--eval_do_sample", type=int, default=1, choices=[0, 1], help="生成评估是否采样（0=贪心，1=采样）")
+    parser.add_argument("--eval_use_chat_template", type=int, default=use_chat_template, choices=[0, 1], help="生成评估是否套用chat_template")
+    parser.add_argument("--eval_prompts", nargs='*', default=default_prompts, help="生成评估用的prompt列表")
+
+
+def should_run_eval(args, step, iters):
+    return getattr(args, 'eval_interval', 0) > 0 and is_main_process() and (step % args.eval_interval == 0 or step == iters)
+
+
+def run_eval_generate(model, tokenizer, args, autocast_ctx, step, title="Eval Generate"):
+    if not getattr(args, 'eval_prompts', None):
+        return
+
+    raw_model = unwrap_model(model)
+    was_training = raw_model.training
+    raw_model.eval()
+
+    Logger(f'\n========== {title} @ step {step} ==========')
+    with torch.inference_mode():
+        for prompt in args.eval_prompts:
+            if getattr(args, 'eval_use_chat_template', 0):
+                prompt_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                inputs = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+            else:
+                inputs = tokenizer(prompt, return_tensors="pt")
+
+            input_ids = inputs["input_ids"].to(args.device)
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(args.device)
+
+            with autocast_ctx:
+                output_ids = raw_model.generate(
+                    inputs=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=args.eval_max_new_tokens,
+                    temperature=args.eval_temperature,
+                    top_p=args.eval_top_p,
+                    do_sample=bool(args.eval_do_sample),
+                    eos_token_id=tokenizer.eos_token_id,
+                )
+            generated_ids = output_ids[0, input_ids.shape[1]:]
+            text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+            Logger(f'[Prompt] {prompt}\n[Output] {text}\n')
+
+    raw_model.train(was_training)
+
+
 def get_lr(current_step, total_steps, lr):
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 

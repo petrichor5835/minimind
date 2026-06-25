@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from model.model_lora import save_lora, apply_lora
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, add_eval_generate_args, should_run_eval, run_eval_generate
 
 warnings.filterwarnings('ignore')
 
@@ -57,7 +57,15 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        should_eval = should_run_eval(args, step, iters)
+        should_save = (step % args.save_interval == 0 or step == iters) and is_main_process()
+
+        del input_ids, labels, res, loss
+
+        if should_eval:
+            run_eval_generate(model, tokenizer, args, autocast_ctx, step)
+
+        if should_save:
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -65,8 +73,6 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             save_lora(model, lora_save_path)
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
-
-        del input_ids, labels, res, loss
 
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
@@ -89,6 +95,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+    add_eval_generate_args(parser, default_interval=1000, default_prompts=["你好，请介绍一下你自己。", "请用三句话说明你的能力。"], use_chat_template=1)
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
